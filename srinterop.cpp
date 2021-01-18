@@ -40,6 +40,7 @@ typedef struct _VPE_FUNCTION
         void* pVPEMode;
         void* pVPEVersion;
         void* pSRParams;
+        void* pCpuGpuCopyParam;
     };
 } VPE_FUNCTION, * PVPE_FUNCTION;
 typedef enum _VPE_SUPER_RESOLUTION_MODE
@@ -71,6 +72,7 @@ enum VPEMode
 {
     VPE_MODE_NONE = 0x0,
     VPE_MODE_PREPROC = 0x1,
+    VPE_MODE_CPU_GPU_COPY = 0x3,
 };
 
 enum VPE_VERSION_ENUM
@@ -92,10 +94,28 @@ enum ScalingMode
     SCALING_MODE_SUPERRESOLUTION              // SuperREsolution
 };
 
+typedef enum _VPE_CPU_GPU_COPY_DIRECTION {
+    VPE_CPU_GPU_COPY_DIRECTION_CPU_TO_GPU,
+    VPE_CPU_GPU_COPY_DIRECTION_GPU_TO_CPU,
+    VPE_CPU_GPU_COPY_DIRECTION_MMC_IN,
+    VPE_CPU_GPU_COPY_DIRECTION_NON_MMC_IN,
+    VPE_CPU_GPU_COPY_DIRECTION_MMC_OUT,
+    VPE_CPU_GPU_COPY_DIRECTION_NON_MMC_OUT,
+} VPE_CPU_GPU_COPY_DIRECTION;
+
+typedef struct _VPE_CPU_GPU_COPY_PARAM
+{
+    VPE_CPU_GPU_COPY_DIRECTION                  Direction;              // [in]
+    UINT                                        MemSize;                // [in]
+    VOID* pSystemMem;            // [in]
+} VPE_CPU_GPU_COPY_PARAM, * PVPE_CPU_GPU_COPY_PARAM;
+
 #define VPE_FN_SCALING_MODE_PARAM            0x37
 #define VPE_FN_MODE_PARAM                    0x20
 #define VPE_FN_SET_VERSION_PARAM             0x01
 #define VPE_FN_SR_SET_PARAMS                 0x401
+
+#define VPE_FN_SET_CPU_GPU_COPY_PARAM       0x2B
 
 static const GUID GUID_VPE_INTERFACE =
 { 0xedd1d4b9, 0x8659, 0x4cbc,{ 0xa4, 0xd6, 0x98, 0x31, 0xa2, 0x16, 0x3a, 0xc3 } };
@@ -282,6 +302,7 @@ int SuperResolution(AVFrame* avframe, AVFrame* outavframe, byte* out2, int width
     VPE_MODE    vpeMode = {};
     SR_SCALING_MODE srScalingParams = {};
     VPE_SR_PARAMS srParams = {};
+    VPE_CPU_GPU_COPY_PARAM cpuGpuCoyParam = {};
 
     const GUID* pExtensionGuid = nullptr;
     UINT        DataSize       = 0;
@@ -498,6 +519,28 @@ int SuperResolution(AVFrame* avframe, AVFrame* outavframe, byte* out2, int width
         goto fail;
     }
 
+    // Clear Mode
+    memset((PVOID)&functionParams, 0, sizeof(functionParams));
+
+    vpeMode.Mode = VPE_MODE_NONE;
+
+    functionParams.Function = VPE_FN_MODE_PARAM;
+    functionParams.pVPEMode = &vpeMode;
+
+    pData = &functionParams;
+    DataSize = sizeof(functionParams);
+    pExtensionGuid = &GUID_VPE_INTERFACE;
+
+    hr = render_video_context->VideoProcessorSetOutputExtension(video_processor_, pExtensionGuid, DataSize, pData);
+    if (FAILED(hr)) {
+        if (nullptr != pLogFile) {
+            memset(szBuffer, 0, 128);
+            sprintf_s(szBuffer, "failed to set output extension for SR mode\r");
+            fwrite(szBuffer, 1, strlen(szBuffer), pLogFile);
+        }
+        return -1;
+    }
+
     // Set SR Params
     memset((PVOID)&functionParams, 0, sizeof(functionParams));
 
@@ -540,18 +583,85 @@ int SuperResolution(AVFrame* avframe, AVFrame* outavframe, byte* out2, int width
             }
         }
     }
-    renderIndex++;
-    render_device_ctx->CopyResource(srOutputStaging, srOutputTexture);
-    D3D11_MAPPED_SUBRESOURCE subres;
-    render_device_ctx->Map(srOutputStaging, 0, D3D11_MAP_READ, 0, &subres);
- 
-    for (int row = 0; row < height; row++) {
-        memcpy(out[ncurrIndex] + width * row, (unsigned char*)((unsigned char*)(subres.pData) + subres.RowPitch * row), width);
+
+    // Set GPUtoCPU Mode
+    memset((PVOID)&functionParams, 0, sizeof(functionParams));
+
+    vpeMode.Mode = VPE_MODE_CPU_GPU_COPY;
+
+    functionParams.Function = VPE_FN_MODE_PARAM;
+    functionParams.pVPEMode = &vpeMode;
+    
+    pData = &functionParams;
+    DataSize = sizeof(functionParams);
+    pExtensionGuid = &GUID_VPE_INTERFACE;
+
+    hr = render_video_context->VideoProcessorSetOutputExtension(video_processor_, pExtensionGuid, DataSize, pData);
+    if (FAILED(hr)) {
+        if (nullptr != pLogFile) {
+            memset(szBuffer, 0, 128);
+            sprintf_s(szBuffer, "failed to set output extension for SR mode\r");
+            fwrite(szBuffer, 1, strlen(szBuffer), pLogFile);
+        }
+        return -1;
     }
 
-    for (int row = 0; row < height / 2; row++) {
-        memcpy(out[ncurrIndex] + width * height + (width)*row, (unsigned char*)((unsigned char*)(subres.pData) + width * height + subres.RowPitch * row), width);
+    // Set GPUtoCPU Params
+    memset((PVOID)&functionParams, 0, sizeof(functionParams));
+    
+    cpuGpuCoyParam.Direction = VPE_CPU_GPU_COPY_DIRECTION_GPU_TO_CPU;
+    cpuGpuCoyParam.MemSize = width * INTEL_ALIGN16(height) * 3 / 2;
+    cpuGpuCoyParam.pSystemMem = out[ncurrIndex];
+    functionParams.Function = VPE_FN_SET_CPU_GPU_COPY_PARAM;
+    functionParams.pCpuGpuCopyParam = &cpuGpuCoyParam;
+
+    pData = &functionParams;
+    DataSize = sizeof(functionParams);
+    pExtensionGuid = &GUID_VPE_INTERFACE;
+
+    hr = render_video_context->VideoProcessorSetOutputExtension(video_processor_, pExtensionGuid, DataSize, pData);
+    if (FAILED(hr)) {
+        if (nullptr != pLogFile) {
+            memset(szBuffer, 0, 128);
+            sprintf_s(szBuffer, "failed to set output extension for SR mode\r");
+            fwrite(szBuffer, 1, strlen(szBuffer), pLogFile);
+        }
+        return -1;
     }
+
+    if (SUCCEEDED(hr)) {
+        hr = render_video_context->VideoProcessorBlt(video_processor_, output_view_,
+            0, 1, &stream_);
+        if (FAILED(hr)) {
+            if (nullptr != pLogFile) {
+                memset(szBuffer, 0, 128);
+                sprintf_s(szBuffer, "VideoProcessorBlt Failed hr=0x%x \r", hr);
+                fwrite(szBuffer, 1, strlen(szBuffer), pLogFile);
+            }
+            return -1;
+        }
+        else
+        {
+            if (nullptr != pLogFile) {
+                memset(szBuffer, 0, 128);
+                sprintf_s(szBuffer, "VideoProcessorBlt success \r");
+                fwrite(szBuffer, 1, strlen(szBuffer), pLogFile);
+            }
+        }
+    }
+
+    renderIndex++;
+    //render_device_ctx->CopyResource(srOutputStaging, srOutputTexture);
+    //D3D11_MAPPED_SUBRESOURCE subres;
+    //render_device_ctx->Map(srOutputStaging, 0, D3D11_MAP_READ, 0, &subres);
+    
+    //for (int row = 0; row < height; row++) {
+    //    memcpy(out[ncurrIndex] + width * row, (unsigned char*)((unsigned char*)(subres.pData) + subres.RowPitch * row), width);
+    //}
+    //
+    //for (int row = 0; row < height / 2; row++) {
+    //    memcpy(out[ncurrIndex] + width * height + (width)*row, (unsigned char*)((unsigned char*)(subres.pData) + width * height + subres.RowPitch * row), width);
+    //}
 
     outavframe->data[0]     = out[ncurrIndex];
     outavframe->data[1]     = out[ncurrIndex] + width * height;
@@ -574,7 +684,7 @@ int SuperResolution(AVFrame* avframe, AVFrame* outavframe, byte* out2, int width
     if (pOutputFile != nullptr) {
         fwrite(out[ncurrIndex], 1, height * width * 3 / 2, pOutputFile);
     }
-    render_device_ctx->Unmap(srOutputStaging, 0);
+    //render_device_ctx->Unmap(srOutputStaging, 0);
     ncurrIndex++;
     if (ncurrIndex >= 4) {
         ncurrIndex = 0;
